@@ -13,9 +13,4 @@
     <PackageReference Include="OutSystems.ExternalLibraries.SDK" Version="1.7.0" />
   </ItemGroup>
 
-  <ItemGroup>
-    <!-- The smoke test decrypts renewed tokens to keep the sign-in file in plain text -->
-    <InternalsVisibleTo Include="McpTriage.Smoke" />
-  </ItemGroup>
-
 </Project>

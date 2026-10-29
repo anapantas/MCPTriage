@@ -1,47 +1,25 @@
 // Runs every library action against a real tenant, the way an ODC app would, before uploading the library.
-// Usage: dotnet run --project McpTriage.Smoke -- <sign-in.json> <tenant> <appKey> [question]
-// The sign-in file is the one `npm run login` writes in ../signin (~/.impactmap-triage-api/odc-library.json).
-// Renewed tokens are written back to it, as the ODC app would save them, but decrypted, so the file stays usable by npm run tokens.
-using System.Security.Cryptography;
+// Usage: dotnet run --project McpTriage.Smoke -- <api-client.json> <tenant> <appKey> [question]
+// The JSON file holds the ODC API client: { "client_id": "...", "client_secret": "..." }. Keep it outside the project.
 using System.Text.Json.Nodes;
 using McpTriage;
 
 if (args.Length < 3)
 {
-    Console.Error.WriteLine("Usage: dotnet run --project McpTriage.Smoke -- <sign-in.json> <tenant> <appKey> [question]");
+    Console.Error.WriteLine("Usage: dotnet run --project McpTriage.Smoke -- <api-client.json> <tenant> <appKey> [question]");
     return 2;
 }
 var (file, tenant, appKey) = (args[0], args[1], args[2]);
 var question = args.Length > 3 ? args[3] : "In two or three sentences: what does this app do, and which screen is the entry point?";
 var library = new McpTriageLibrary();
-// A fresh TokenKey per run, as an app would keep one in a secret Setting
-var tokenKey = Convert.ToBase64String(RandomNumberGenerator.GetBytes(32));
-
-McpConnection Connection()
+var client = JsonNode.Parse(File.ReadAllText(file));
+var connection = new McpConnection
 {
-    var stored = JsonNode.Parse(File.ReadAllText(file));
-    return new McpConnection
-    {
-        TenantHostname = tenant,
-        ClientId = stored["client"]["client_id"].GetValue<string>(),
-        AccessToken = stored["tokens"]?["access_token"]?.GetValue<string>(),
-        RefreshToken = stored["tokens"]["refresh_token"].GetValue<string>(),
-        AllowedAppKeys = appKey,
-        TokenKey = tokenKey,
-    };
-}
-
-void Save(McpTokens tokens)
-{
-    if (!tokens.Renewed) return;
-    var key = TokenSeal.Key(tokenKey);
-    var stored = JsonNode.Parse(File.ReadAllText(file));
-    stored["tokens"]["access_token"] = TokenSeal.Open(key, nameof(McpTokens.AccessToken), tokens.AccessToken);
-    stored["tokens"]["refresh_token"] = TokenSeal.Open(key, nameof(McpTokens.RefreshToken), tokens.RefreshToken);
-    stored["savedAt"] = DateTime.UtcNow.ToString("O");
-    File.WriteAllText(file, stored.ToJsonString(new System.Text.Json.JsonSerializerOptions { WriteIndented = true }));
-    Console.WriteLine($"  (tokens renewed; sign-in valid until {tokens.RefreshTokenExpiresOn:u})");
-}
+    TenantHostname = tenant,
+    ClientId = client["client_id"].GetValue<string>(),
+    ClientSecret = client["client_secret"].GetValue<string>(),
+    AllowedAppKeys = appKey,
+};
 
 void ExpectError(string code, Action action)
 {
@@ -51,7 +29,7 @@ void ExpectError(string code, Action action)
     }
     catch (McpTriageException err) when (err.Code == code)
     {
-        Console.WriteLine($"  ok: {err.Message}");
+        Console.WriteLine($"  ok: {err.Message[..Math.Min(200, err.Message.Length)]}");
         return;
     }
     throw new Exception($"expected [{code}]");
@@ -72,88 +50,83 @@ void Step(string name, Action action)
     }
 }
 
-Step("RenewTokens", () =>
+Step("CheckConnection", () =>
 {
-    var tokens = library.RenewTokens(Connection());
-    Save(tokens);
-    if (!tokens.AccessToken.StartsWith("mcpt1.") || !tokens.RefreshToken.StartsWith("mcpt1.")) throw new Exception("tokens came back unencrypted");
-    Console.WriteLine($"  access token until {tokens.AccessTokenExpiresOn:u}, sign-in until {tokens.RefreshTokenExpiresOn:u}; tokens encrypted");
+    var info = library.CheckConnection(connection);
+    Console.WriteLine($"  {info.TenantHostname} sees {info.Identity}; access token until {info.AccessTokenExpiresOn:u}");
 });
 
-Step("Encrypted tokens work as input; a wrong TokenKey is refused", () =>
+Step("A wrong secret is refused", () =>
 {
-    library.ListElements(Connection(), appKey, "roles", 1, 0, out var first);
-    Save(first);
-    var encrypted = Connection() with { AccessToken = first.AccessToken, RefreshToken = first.RefreshToken };
-    var result = library.ListElements(encrypted, appKey, "roles", 1, 0, out var second);
-    Save(second);
-    Console.WriteLine($"  call with encrypted tokens: {result.Total} roles");
-    ExpectError("token_key_mismatch", () => library.ListElements(encrypted with { TokenKey = new string('x', 40) }, appKey, "roles", 1, 0, out _));
+    ExpectError("invalid_client", () => library.CheckConnection(connection with { ClientSecret = "wrong-" + Guid.NewGuid() }));
 });
 
 Step("Apps outside AllowedAppKeys are refused", () =>
 {
-    ExpectError("app_not_allowed", () => library.GetAppLogs(Connection() with { AllowedAppKeys = Guid.NewGuid().ToString() }, appKey, "", 24, "", 1, "", 0, out _));
-    ExpectError("app_not_allowed", () => library.GetAppLogs(Connection() with { AllowedAppKeys = "" }, appKey, "", 24, "", 1, "", 0, out _));
+    ExpectError("app_not_allowed", () => library.GetAppLogs(connection with { AllowedAppKeys = Guid.NewGuid().ToString() }, appKey, "", 24, "", 1, ""));
+    ExpectError("app_not_allowed", () => library.GetAppLogs(connection with { AllowedAppKeys = "" }, appKey, "", 24, "", 1, ""));
 });
 
 Step("ListElements screens, two pages", () =>
 {
-    var first = library.ListElements(Connection(), appKey, "screens", 2, 0, out var tokens);
-    Save(tokens);
+    var first = library.ListElements(connection, appKey, "screens", 2);
     Console.WriteLine($"  {first.Total} screens, page 1: {string.Join(", ", first.Elements.Select(e => e.Name))}, hasMore={first.HasMore}, nextOffset={first.NextOffset}");
     if (!first.HasMore) return;
-    var second = library.ListElements(Connection(), appKey, "screens", 2, first.NextOffset, out tokens);
-    Save(tokens);
+    var second = library.ListElements(connection, appKey, "screens", 2, first.NextOffset);
     Console.WriteLine($"  page 2: {string.Join(", ", second.Elements.Select(e => e.Name))}");
     if (second.Elements.Any(e => first.Elements.Any(f => f.Key == e.Key))) throw new Exception("page 2 repeats page 1");
 });
 
 Step("SearchModel", () =>
 {
-    var result = library.SearchModel(Connection(), appKey, "municipality", "", 3, 0, out var tokens);
-    Save(tokens);
+    var result = library.SearchModel(connection, appKey, "municipality", "", 3);
     Console.WriteLine($"  {result.Total} matches: {string.Join(", ", result.Elements.Select(e => $"{e.ObjectType}:{e.Name}"))}, hasMore={result.HasMore}");
 });
 
-Step("GetAppLogs, two pages", () =>
+Step("GetAppLogs, two pages (Development)", () =>
 {
-    var first = library.GetAppLogs(Connection(), appKey, "", 168, "", 3, "", 0, out var tokens);
-    Save(tokens);
+    var first = library.GetAppLogs(connection, appKey, "", 168, "", 3, "");
     var newest = first.Entries.FirstOrDefault().Message ?? "";
     Console.WriteLine($"  {first.Total} errors/warnings in 7 days, hasMore={first.HasMore}; newest: {newest[..Math.Min(120, newest.Length)]}");
     if (!first.HasMore) return;
-    var second = library.GetAppLogs(Connection(), appKey, "", 168, "", 3, "", first.NextOffset, out tokens);
-    Save(tokens);
+    var second = library.GetAppLogs(connection, appKey, "", 168, "", 3, "", first.NextOffset);
     if (second.Entries.Any(e => first.Entries.Any(f => f.LogId == e.LogId))) throw new Exception("page 2 repeats page 1");
     Console.WriteLine($"  page 2: {second.Entries.Count} entries, none repeated");
 });
 
-Step("GetAppTraces", () =>
+Step("GetAppTraces (Development)", () =>
 {
-    var result = library.GetAppTraces(Connection(), appKey, false, 168, 1000, 3, "", 0, out var tokens);
-    Save(tokens);
+    var result = library.GetAppTraces(connection, appKey, false, 168, 1000, 3, "");
     Console.WriteLine($"  {result.Total} requests over 1 s in 7 days, hasMore={result.HasMore}; " + string.Join("; ", result.Traces.Select(t => $"{t.SpanName} {t.DurationMs} ms")));
 });
 
+// Informational: depends on the API client's Monitoring permission in Production, not on the library
+Console.WriteLine("== GetAppLogs (Production), informational");
+try
+{
+    var prod = library.GetAppLogs(connection, appKey, "", 168, "", 1, "Production");
+    Console.WriteLine($"  readable: {prod.Total} errors/warnings in 7 days");
+}
+catch (McpTriageException err)
+{
+    Console.WriteLine($"  not readable: [{err.Code}]");
+}
+
 Step("StartAnalysis + PollAnalysis", () =>
 {
-    var started = library.StartAnalysis(Connection(), appKey, question, out var tokens);
-    Save(tokens);
+    var started = library.StartAnalysis(connection, appKey, question);
     Console.WriteLine($"  session {started.SessionId}, run {started.RunId}");
     var answer = "";
     var cursor = 0L;
     var replayChecked = false;
     for (var poll = 1; poll <= 60; poll++)
     {
-        var progress = library.PollAnalysis(Connection(), started.SessionId, started.RunId, cursor, answer.Length > 0, 20, out tokens);
-        Save(tokens);
+        var progress = library.PollAnalysis(connection, started.SessionId, started.RunId, cursor, answer.Length > 0, 20);
         // As if the app had failed to save: the same cursor must give the same events again (and maybe more)
         if (!replayChecked && !progress.IsFinished && progress.NextCursor > cursor)
         {
             replayChecked = true;
-            var again = library.PollAnalysis(Connection(), started.SessionId, started.RunId, cursor, answer.Length > 0, 1, out tokens);
-            Save(tokens);
+            var again = library.PollAnalysis(connection, started.SessionId, started.RunId, cursor, answer.Length > 0, 1);
             if (again.NextCursor < progress.NextCursor
                 || !again.NewText.StartsWith(progress.NewText, StringComparison.Ordinal)
                 || !again.NewSteps.StartsWith(progress.NewSteps, StringComparison.Ordinal))
@@ -171,13 +144,13 @@ Step("StartAnalysis + PollAnalysis", () =>
             return;
         }
     }
-    library.CloseAnalysis(Connection(), started.SessionId);
+    library.CloseAnalysis(connection, started.SessionId);
     throw new Exception("No answer after 60 polls; conversation closed");
 });
 
 Step("Bad input is refused", () =>
 {
-    ExpectError("invalid_kind", () => library.ListElements(Connection(), appKey, "widgets", 5, 0, out _));
+    ExpectError("invalid_kind", () => library.ListElements(connection, appKey, "widgets", 5));
 });
 
 Console.WriteLine(failures == 0 ? "ALL PASSED" : $"{failures} FAILED");

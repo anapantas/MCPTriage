@@ -23,7 +23,7 @@ public class McpTriageLibrary : IMcpTriage
     private static readonly HashSet<string> Terminal = new() { "succeeded", "failed", "cancelled", "not_found" };
     private static readonly HashSet<string> ElementKinds = new() { "entities", "actions", "screens", "structures", "roles", "themes", "agents", "connections" };
 
-    public AnalysisStart StartAnalysis(McpConnection connection, string appKey, string question, out McpTokens tokens)
+    public AnalysisStart StartAnalysis(McpConnection connection, string appKey, string question)
     {
         RequireAllowedApp(connection, appKey);
         question = question?.Trim();
@@ -44,7 +44,6 @@ public class McpTriageLibrary : IMcpTriage
             });
             var runId = Json.Str(started?["runId"]);
             if (string.IsNullOrEmpty(runId)) throw new McpTriageException("mentor_not_started", $"Mentor did not start a run: {started?.ToJsonString()}");
-            tokens = mcp.Tokens;
             return new AnalysisStart { SessionId = sessionId, RunId = runId };
         }
         catch
@@ -54,7 +53,7 @@ public class McpTriageLibrary : IMcpTriage
         }
     }
 
-    public AnalysisProgress PollAnalysis(McpConnection connection, string sessionId, string runId, long cursor, bool answerStarted, int maxWaitSeconds, out McpTokens tokens)
+    public AnalysisProgress PollAnalysis(McpConnection connection, string sessionId, string runId, long cursor, bool answerStarted, int maxWaitSeconds)
     {
         RequireGuid(sessionId, nameof(sessionId));
         RequireGuid(runId, nameof(runId));
@@ -135,11 +134,10 @@ public class McpTriageLibrary : IMcpTriage
         progress.NewSteps = Limits.Cut(steps.ToString().TrimEnd(), Len.Steps);
         progress.Title = Limits.Cut(progress.Title, Len.Title);
         progress.ErrorMessage = Limits.Cut(progress.ErrorMessage, Len.ErrorMessage);
-        tokens = mcp.Tokens;
         return progress;
     }
 
-    public McpTokens CloseAnalysis(McpConnection connection, string sessionId)
+    public void CloseAnalysis(McpConnection connection, string sessionId)
     {
         RequireGuid(sessionId, nameof(sessionId));
         using var mcp = new McpClient(connection);
@@ -151,10 +149,9 @@ public class McpTriageLibrary : IMcpTriage
         {
             // already closed
         }
-        return mcp.Tokens;
     }
 
-    public ModelElementList SearchModel(McpConnection connection, string appKey, string query, string objectTypes, int limit, int offset, out McpTokens tokens)
+    public ModelElementList SearchModel(McpConnection connection, string appKey, string query, string objectTypes, int limit, int offset = 0)
     {
         RequireAllowedApp(connection, appKey);
         if (string.IsNullOrWhiteSpace(query)) throw new McpTriageException("query_required", "Say what to look for");
@@ -163,12 +160,10 @@ public class McpTriageLibrary : IMcpTriage
         if (types.Count > 0) args["objects"] = types;
 
         using var mcp = new McpClient(connection);
-        var result = ContextPage(mcp, "context_search", args, Clamp(limit, 20, 100), Math.Max(0, offset));
-        tokens = mcp.Tokens;
-        return result;
+        return ContextPage(mcp, "context_search", args, Clamp(limit, 20, 100), Math.Max(0, offset));
     }
 
-    public ModelElementList ListElements(McpConnection connection, string appKey, string kind, int limit, int offset, out McpTokens tokens)
+    public ModelElementList ListElements(McpConnection connection, string appKey, string kind, int limit, int offset = 0)
     {
         RequireAllowedApp(connection, appKey);
         kind = kind?.Trim().ToLowerInvariant();
@@ -176,12 +171,10 @@ public class McpTriageLibrary : IMcpTriage
             throw new McpTriageException("invalid_kind", $"kind must be one of: {string.Join(", ", ElementKinds)}");
 
         using var mcp = new McpClient(connection);
-        var result = SortedPage(mcp, $"context_{kind}", appKey, Clamp(limit, 50, 100), Math.Max(0, offset));
-        tokens = mcp.Tokens;
-        return result;
+        return SortedPage(mcp, $"context_{kind}", appKey, Clamp(limit, 50, 100), Math.Max(0, offset));
     }
 
-    public LogList GetAppLogs(McpConnection connection, string appKey, string severities, int hours, string search, int limit, string stage, int offset, out McpTokens tokens)
+    public LogList GetAppLogs(McpConnection connection, string appKey, string severities, int hours, string search, int limit, string stage, int offset = 0)
     {
         RequireAllowedApp(connection, appKey);
         offset = Math.Max(0, offset);
@@ -202,11 +195,10 @@ public class McpTriageLibrary : IMcpTriage
             LogId = Limits.Cut(Json.Str(row?["logId"]), Len.Key),
         }).ToList();
         var page = PageOf(rows, answer, offset);
-        tokens = mcp.Tokens;
         return new LogList { Entries = page.Rows, Total = page.Total, HasMore = page.HasMore, NextOffset = page.NextOffset };
     }
 
-    public TraceList GetAppTraces(McpConnection connection, string appKey, bool errorsOnly, int hours, int minDurationMs, int limit, string stage, int offset, out McpTokens tokens)
+    public TraceList GetAppTraces(McpConnection connection, string appKey, bool errorsOnly, int hours, int minDurationMs, int limit, string stage, int offset = 0)
     {
         RequireAllowedApp(connection, appKey);
         offset = Math.Max(0, offset);
@@ -229,15 +221,21 @@ public class McpTriageLibrary : IMcpTriage
             NumberOfErrors = (int)Json.Long(row?["numberOfErrors"]),
         }).ToList();
         var page = PageOf(rows, answer, offset);
-        tokens = mcp.Tokens;
         return new TraceList { Traces = page.Rows, Total = page.Total, HasMore = page.HasMore, NextOffset = page.NextOffset };
     }
 
-    public McpTokens RenewTokens(McpConnection connection)
+    public ConnectionInfo CheckConnection(McpConnection connection)
     {
         using var mcp = new McpClient(connection);
-        mcp.ForceRenew();
-        return mcp.Tokens;
+        var status = mcp.CallTool("auth_status", new JsonObject());
+        if (!Json.True(status?["logged_in"]))
+            throw new McpTriageException("access_denied", "The MCP server didn't accept the API client's token");
+        return new ConnectionInfo
+        {
+            TenantHostname = Limits.Cut(Json.Str(status?["tenant_hostname"]), Len.Hostname),
+            Identity = Limits.Cut(Json.Str(status?["user_id"]), Len.Key),
+            AccessTokenExpiresOn = mcp.AccessTokenExpiresOn,
+        };
     }
 
     // One page of a context tool, in the server's order (for search, by relevance)

@@ -8,9 +8,8 @@ internal static class Len
 {
     public const int Hostname = 255;
     public const int ClientId = 4000;
-    public const int Token = 8000;
+    public const int ClientSecret = 500;
     public const int AllowedAppKeys = 4000;
-    public const int TokenKey = 200;
     public const int Id = 50;
     public const int Status = 20;
     public const int AnswerText = 1_000_000;
@@ -30,48 +29,36 @@ internal static class Len
     public const int SpanName = 1000;
 }
 
-[OSStructure(Description = "The stored sign-in every action needs. How to use: build it in one Server Action (GetMcpConnection) from the McpTenant, McpClientId, McpAllowedAppKeys and McpTokenKey Settings and the saved token row, and pass it as Connection to every action. Never show it on a screen or send it to the browser.")]
+[OSStructure(Description = "How to reach the tenant's MCP server as an ODC API client. How to use: build it in one Server Action (GetMcpConnection) from the McpTenant, McpClientId, McpClientSecret and McpAllowedAppKeys Settings, and pass it as Connection to every action. Never show it on a screen or send it to the browser.")]
 public struct McpConnection
 {
     [OSStructureField(Description = "Tenant hostname without https:// or a path, e.g. mycompany.outsystems.dev", Length = Len.Hostname, IsMandatory = true)]
     public string TenantHostname;
 
-    [OSStructureField(Description = "OAuth client id of the stored sign-in, as printed by npm run tokens in the library's signin tool. Keep it in a secret Setting.", Length = Len.ClientId, IsMandatory = true)]
+    [OSStructureField(Description = "Client ID of the ODC API client (ODC Portal > API clients). Keep it in a secret Setting.", Length = Len.ClientId, IsMandatory = true)]
     public string ClientId;
 
-    [OSStructureField(Description = "The last AccessToken the library returned (encrypted). May be empty or expired: the library renews it when needed.", Length = Len.Token)]
-    public string AccessToken;
+    [OSStructureField(Description = "Client secret of the ODC API client. Keep it only in a secret Setting; regenerating it in ODC Portal means updating that Setting.", Length = Len.ClientSecret, IsMandatory = true)]
+    public string ClientSecret;
 
-    [OSStructureField(Description = "The last RefreshToken the library returned (encrypted); the first time, the plain one printed by npm run tokens, from a secret Setting.", Length = Len.Token, IsMandatory = true)]
-    public string RefreshToken;
-
-    [OSStructureField(Description = "The apps this connection may read: asset keys separated by commas, or * for every app the signed-in person can see. Actions on any other app fail with [app_not_allowed]. Keep it in a Setting.", Length = Len.AllowedAppKeys, IsMandatory = true)]
+    [OSStructureField(Description = "The apps this connection may read: asset keys separated by commas, or * for every app the API client can see. Actions on any other app fail with [app_not_allowed]. Keep it in a Setting.", Length = Len.AllowedAppKeys, IsMandatory = true)]
     public string AllowedAppKeys;
-
-    [OSStructureField(Description = "Secret of at least 32 characters, from a secret Setting (npm run tokens suggests one). The library returns tokens encrypted with it and decrypts them when they come back. Changing it makes the stored tokens unreadable: delete them so the bootstrap token is used again.", Length = Len.TokenKey, IsMandatory = true)]
-    public string TokenKey;
 }
 
-[OSStructure(Description = "The sign-in after a call, encrypted with TokenKey. How to use: after every action, if Renewed is True, save AccessToken and RefreshToken in place of the stored ones, or the next call starts from tokens that no longer work. Encrypted, they are useless without TokenKey, but still keep them off screens.")]
-public struct McpTokens
+[OSStructure(Description = "Whether the API client can reach the tenant's MCP server. How to use: call CheckConnection from a daily Timer and alert an admin when it fails.")]
+public struct ConnectionInfo
 {
-    [OSStructureField(Description = "True when the library renewed the tokens during this call: save AccessToken and RefreshToken")]
-    public bool Renewed;
+    [OSStructureField(Description = "Tenant the MCP server answered for", Length = Len.Hostname)]
+    public string TenantHostname;
 
-    [OSStructureField(Description = "Access token, encrypted with TokenKey: store it and pass it back in McpConnection.AccessToken", Length = Len.Token)]
-    public string AccessToken;
+    [OSStructureField(Description = "Who the MCP server sees: the API client's ID", Length = Len.Key)]
+    public string Identity;
 
-    [OSStructureField(Description = "Refresh token, encrypted with TokenKey: store it and pass it back in McpConnection.RefreshToken", Length = Len.Token)]
-    public string RefreshToken;
-
-    [OSStructureField(Description = "When the access token expires (UTC); 1900-01-01 if unknown. Informational: the library renews it on its own.")]
+    [OSStructureField(Description = "When the current access token expires (UTC). Informational: the library gets a new one on its own.")]
     public DateTime AccessTokenExpiresOn;
-
-    [OSStructureField(Description = "When the stored sign-in stops working and someone must sign in again (UTC); 1900-01-01 if unknown. Alert an admin before this time.")]
-    public DateTime RefreshTokenExpiresOn;
 }
 
-[OSStructure(Description = "A Mentor analysis that has started. How to use: save SessionId and RunId with the analysis, then call PollAnalysis with Cursor 0. The sign-in comes back in the action's separate Tokens output.")]
+[OSStructure(Description = "A Mentor analysis that has started. How to use: save SessionId and RunId with the analysis, then call PollAnalysis with Cursor 0.")]
 public struct AnalysisStart
 {
     [OSStructureField(Description = "Mentor conversation id: pass it to PollAnalysis and CloseAnalysis", Length = Len.Id)]

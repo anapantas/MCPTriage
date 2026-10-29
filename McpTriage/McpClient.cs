@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Net;
 using System.Net.Http.Headers;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
@@ -20,25 +21,29 @@ public sealed class McpTriageException : Exception
     }
 }
 
-// One connection to https://<tenant>/mcp for the length of one library call: MCP over HTTP (JSON-RPC),
-// with the OAuth access token renewed from the refresh token when the server answers 401.
+// One connection to https://<tenant>/mcp for the length of one library call: MCP over HTTP (JSON-RPC), signed in
+// as an ODC API client (client_credentials grant), so no person and no stored sign-in are involved.
 // All its traffic shares one time budget (Limits.CallTime), so a call ends before ODC's 95 s limit.
 internal sealed class McpClient : IDisposable
 {
     private const string ProtocolVersion = "2025-06-18";
-    // No redirects: a 307/308 would resend the refresh token or the bearer to wherever the answer points
+    // No redirects: a 307/308 would resend the client secret or the bearer to wherever the answer points
     private static readonly HttpClient Http = new(new SocketsHttpHandler { AllowAutoRedirect = false }) { Timeout = Limits.CallTime };
     private static readonly ConcurrentDictionary<string, string> TokenEndpoints = new();
+    // Access tokens per API client, in memory only, reused while the execution context lives: they last hours, and asking
+    // for one on every call costs a round trip. Keyed by a hash, so the secret itself is never kept.
+    private static readonly ConcurrentDictionary<string, (string Token, DateTime ExpiresOn)> AccessTokens = new();
+    private static readonly TimeSpan TokenMargin = TimeSpan.FromMinutes(5);
     private static readonly Regex Hostname = new("^[A-Za-z0-9.-]+$");
     internal static readonly DateTime NullDate = new(1900, 1, 1, 0, 0, 0, DateTimeKind.Utc);
 
     private readonly Stopwatch _clock = Stopwatch.StartNew();
     private readonly string _tenant;
     private readonly string _clientId;
-    private readonly byte[] _tokenKey;
+    private readonly string _clientSecret;
+    private readonly string _cacheKey;
     private string _accessToken;
-    private string _refreshToken;
-    private bool _renewed;
+    private DateTime _accessTokenExpiresOn = NullDate;
     private string _sessionId;
     private string _protocolVersion;
     private bool _initialized;
@@ -49,12 +54,11 @@ internal sealed class McpClient : IDisposable
         _tenant = connection.TenantHostname?.Trim();
         if (string.IsNullOrEmpty(_tenant) || !Hostname.IsMatch(_tenant))
             throw new McpTriageException("invalid_connection", "TenantHostname must be a hostname such as mycompany.outsystems.dev, without https:// or a path");
-        if (string.IsNullOrWhiteSpace(connection.ClientId) || string.IsNullOrWhiteSpace(connection.RefreshToken))
-            throw new McpTriageException("invalid_connection", "ClientId and RefreshToken are required");
+        if (string.IsNullOrWhiteSpace(connection.ClientId) || string.IsNullOrWhiteSpace(connection.ClientSecret))
+            throw new McpTriageException("invalid_connection", "ClientId and ClientSecret of the ODC API client are required");
         _clientId = connection.ClientId.Trim();
-        _tokenKey = TokenSeal.Key(connection.TokenKey);
-        _accessToken = TokenSeal.Open(_tokenKey, nameof(McpTokens.AccessToken), connection.AccessToken?.Trim());
-        _refreshToken = TokenSeal.Open(_tokenKey, nameof(McpTokens.RefreshToken), connection.RefreshToken.Trim());
+        _clientSecret = connection.ClientSecret.Trim();
+        _cacheKey = Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes($"{_tenant}\n{_clientId}\n{_clientSecret}")));
     }
 
     private Uri McpUri => new($"https://{_tenant}/mcp");
@@ -62,15 +66,8 @@ internal sealed class McpClient : IDisposable
     // Time left in this call's budget
     public TimeSpan Remaining => Limits.CallTime - _clock.Elapsed;
 
-    // Always encrypted with the app's TokenKey: the app stores and passes back only encrypted tokens
-    public McpTokens Tokens => new()
-    {
-        Renewed = _renewed,
-        AccessToken = TokenSeal.Seal(_tokenKey, nameof(McpTokens.AccessToken), _accessToken),
-        RefreshToken = TokenSeal.Seal(_tokenKey, nameof(McpTokens.RefreshToken), _refreshToken),
-        AccessTokenExpiresOn = JwtExpiry(_accessToken),
-        RefreshTokenExpiresOn = JwtExpiry(_refreshToken),
-    };
+    // When the access token in use expires (UTC); NullDate before the first request
+    public DateTime AccessTokenExpiresOn => _accessTokenExpiresOn;
 
     // Calls one tool and returns its answer: the parsed JSON of its first text block.
     public JsonNode CallTool(string name, JsonObject arguments)
@@ -85,7 +82,11 @@ internal sealed class McpClient : IDisposable
         {
             var message = string.Join("\n", texts);
             var code = Regex.Match(message, @"\[code: ([^\]]+)\]\s*$");
-            throw new McpTriageException(code.Success ? code.Groups[1].Value : "tool_error", $"{name}: {Shorten(message)}");
+            if (code.Success) throw new McpTriageException(code.Groups[1].Value, $"{name}: {Shorten(message)}");
+            // The API client lacks the permission in ODC Portal, e.g. logs in a stage it can't read
+            if (message.Contains("403 Forbidden", StringComparison.Ordinal))
+                throw new McpTriageException("permission_denied", $"{name}: the API client has no permission for this. Grant it in ODC Portal > API clients > Edit permissions, for the stage asked. {Shorten(message)}");
+            throw new McpTriageException("tool_error", $"{name}: {Shorten(message)}");
         }
         if (texts.Count == 0) return null;
         try
@@ -97,8 +98,6 @@ internal sealed class McpClient : IDisposable
             return JsonValue.Create(texts[0]);
         }
     }
-
-    public void ForceRenew() => Renew();
 
     // Ends the MCP session on the server; failures are irrelevant, the server expires it anyway.
     public void Dispose()
@@ -135,14 +134,9 @@ internal sealed class McpClient : IDisposable
 
     private JsonNode Send(JsonObject message, bool expectResponse)
     {
-        // Each recovery is tried once per message, independently: a renewed token, then a new MCP session
-        var renewed = false;
+        // Each recovery is tried once per message, independently: a new access token, then a new MCP session
+        var fresh = _accessToken == null && GetToken(false);
         var reconnected = false;
-        if (string.IsNullOrEmpty(_accessToken))
-        {
-            Renew();
-            renewed = true;
-        }
         var isInitialize = Json.Str(message["method"]) == "initialize";
         for (;;)
         {
@@ -160,9 +154,9 @@ internal sealed class McpClient : IDisposable
 
                 if (response.StatusCode == HttpStatusCode.Unauthorized)
                 {
-                    if (renewed) throw new McpTriageException("sign_in_expired", "The MCP server refused the renewed token. Sign in again and save the new tokens.");
-                    Renew();
-                    renewed = true;
+                    if (fresh) throw new McpTriageException("access_denied", "The MCP server refused a new access token for the API client. Check that the client is active in ODC Portal > API clients.");
+                    GetToken(true);
+                    fresh = true;
                     continue;
                 }
                 // The server forgot our MCP session: start a new one
@@ -244,16 +238,23 @@ internal sealed class McpClient : IDisposable
         return message["result"];
     }
 
-    private void Renew()
+    // An access token for the API client: the one in memory while it has more than TokenMargin left, otherwise a new one.
+    // Returns true when it asked for a new one.
+    private bool GetToken(bool fresh)
     {
+        if (!fresh && AccessTokens.TryGetValue(_cacheKey, out var known) && known.ExpiresOn - TokenMargin > DateTime.UtcNow)
+        {
+            (_accessToken, _accessTokenExpiresOn) = known;
+            return false;
+        }
+
         using var request = new HttpRequestMessage(HttpMethod.Post, TokenEndpoint())
         {
             Content = new FormUrlEncodedContent(new Dictionary<string, string>
             {
-                ["grant_type"] = "refresh_token",
-                ["refresh_token"] = _refreshToken,
+                ["grant_type"] = "client_credentials",
                 ["client_id"] = _clientId,
-                ["resource"] = McpUri.ToString(),
+                ["client_secret"] = _clientSecret,
             }),
         };
         using var timeout = Timeout();
@@ -271,56 +272,42 @@ internal sealed class McpClient : IDisposable
         }
         if (status is HttpStatusCode.BadRequest or HttpStatusCode.Unauthorized)
         {
-            // e.g. "refresh token issued before the client session started": someone signed in again with this client
+            // e.g. "Invalid client or Invalid client credentials": a wrong secret, or a client deleted, suspended or given a new secret
             var reason = TryParse(body) is JsonObject error ? Json.Str(error["error_description"]) ?? Json.Str(error["error"]) : null;
-            throw new McpTriageException("sign_in_expired", "The stored sign-in can no longer be renewed: it ends with the browser sign-in session, or when someone signs in again with the same client. "
-                + $"Sign in again and save the new tokens.{(reason == null ? "" : $" Server: {Shorten(reason)}")}");
+            throw new McpTriageException("invalid_client", "ODC refused the API client: check ClientId and ClientSecret, and that the client wasn't deleted, suspended or given a new secret."
+                + (reason == null ? "" : $" Server: {Shorten(reason)}"));
         }
         if ((int)status is < 200 or > 299)
-            throw new McpTriageException("token_renewal_failed", $"HTTP {(int)status}: {Shorten(body)}");
+            throw new McpTriageException("token_request_failed", $"HTTP {(int)status}: {Shorten(body)}");
 
-        var json = JsonNode.Parse(body);
-        _accessToken = Json.Str(json?["access_token"]) ?? throw new McpTriageException("token_renewal_failed", "No access_token in the answer");
-        var refresh = Json.Str(json?["refresh_token"]);
-        if (!string.IsNullOrEmpty(refresh)) _refreshToken = refresh;
-        _renewed = true;
+        var json = TryParse(body);
+        _accessToken = Json.Str(json?["access_token"]) ?? throw new McpTriageException("token_request_failed", "No access_token in the answer");
+        var lifetime = Json.Long(json?["expires_in"]);
+        _accessTokenExpiresOn = DateTime.UtcNow.AddSeconds(lifetime > 0 ? lifetime : 300);
+        AccessTokens[_cacheKey] = (_accessToken, _accessTokenExpiresOn);
+        return true;
     }
 
-    // The token endpoint comes from the tenant's OAuth metadata; /mcp/token is what the tenants publish today.
-    // Only a discovered endpoint is kept, so a slow or failed discovery is tried again on a later call.
-    // The refresh token goes only to https on the tenant's own host, whatever the metadata says.
+    // The token endpoint comes from the tenant's OpenID configuration. Only a discovered endpoint is kept, so a slow or
+    // failed discovery is tried again on a later call. The secret goes only to https on the tenant's own host.
     private string TokenEndpoint()
     {
         if (TokenEndpoints.TryGetValue(_tenant, out var known)) return known;
+        string endpoint = null;
         try
         {
             using var timeout = new CancellationTokenSource(Min(Remaining, TimeSpan.FromSeconds(10)));
-            using var response = Http.Send(new HttpRequestMessage(HttpMethod.Get, $"https://{_tenant}/.well-known/oauth-authorization-server/mcp"), timeout.Token);
-            if (response.IsSuccessStatusCode && Json.Str(JsonNode.Parse(ReadAll(response))?["token_endpoint"]) is { } endpoint
-                && Uri.TryCreate(endpoint, UriKind.Absolute, out var uri) && uri.Scheme == Uri.UriSchemeHttps
-                && string.Equals(uri.Host, _tenant, StringComparison.OrdinalIgnoreCase))
-                return TokenEndpoints[_tenant] = endpoint;
+            using var response = Http.Send(new HttpRequestMessage(HttpMethod.Get, $"https://{_tenant}/identity/.well-known/openid-configuration"), timeout.Token);
+            if (response.IsSuccessStatusCode) endpoint = Json.Str(TryParse(ReadAll(response))?["token_endpoint"]);
         }
-        catch
+        catch (Exception err) when (err is not McpTriageException)
         {
-            // fall back below
+            throw new McpTriageException("token_request_failed", $"Couldn't read the tenant's sign-in configuration: {err.Message}");
         }
-        return $"https://{_tenant}/mcp/token";
-    }
-
-    internal static DateTime JwtExpiry(string token)
-    {
-        try
-        {
-            var payload = token.Split('.')[1].Replace('-', '+').Replace('_', '/');
-            payload = payload.PadRight(payload.Length + (4 - payload.Length % 4) % 4, '=');
-            var exp = JsonNode.Parse(Convert.FromBase64String(payload))?["exp"]?.GetValue<long>();
-            return exp is { } seconds ? DateTimeOffset.FromUnixTimeSeconds(seconds).UtcDateTime : NullDate;
-        }
-        catch
-        {
-            return NullDate;
-        }
+        if (endpoint == null || !Uri.TryCreate(endpoint, UriKind.Absolute, out var uri) || uri.Scheme != Uri.UriSchemeHttps
+            || !string.Equals(uri.Host, _tenant, StringComparison.OrdinalIgnoreCase))
+            throw new McpTriageException("token_request_failed", $"The tenant's sign-in configuration has no token endpoint on https://{_tenant}");
+        return TokenEndpoints[_tenant] = endpoint;
     }
 
     private static JsonNode TryParse(string text)
