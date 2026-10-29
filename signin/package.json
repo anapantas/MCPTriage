@@ -1,0 +1,15 @@
+{
+  "name": "mcptriage-signin",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Signs in to the tenant's OutSystems MCP server once and prints the McpConnection values the McpTriage library needs",
+  "type": "module",
+  "engines": { "node": ">=22" },
+  "scripts": {
+    "login": "node --use-system-ca login.js",
+    "tokens": "node tokens.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.32.1"
+  }
+}
