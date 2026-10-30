@@ -151,7 +151,7 @@ A Mentor answer can take as long as it needs: each `PollAnalysis` call ends with
 
 ### 4. Read logs and traces
 
-`GetAppLogs(GetMcpConnection(), AppKey, "Error", 48, "", 50, "")` for errors in the last 48 hours in Development. `GetAppTraces(GetMcpConnection(), AppKey, True, 24, 0, 50, "Production")` for failed requests in Production. For the next page, call again with the same filters and `Offset = Result.NextOffset` while `Result.HasMore`. A stage the API client has no Monitoring permission for fails with `[permission_denied]`.
+`GetAppLogs(GetMcpConnection(), AppKey, "Error", 48, "", 50, "")` for errors in the last 48 hours in Development. `GetAppTraces(GetMcpConnection(), AppKey, True, 24, 0, 50, "")` for failed requests in the last 24 hours. For the next page, call again with the same filters and `Offset = Result.NextOffset` while `Result.HasMore`. Only Development can be read: Test and Production answer `[permission_denied]` (see Known limitations).
 
 ### 5. Know when the connection breaks
 
@@ -159,7 +159,8 @@ A daily Timer calls `CheckConnection(GetMcpConnection())` and alerts an admin (e
 
 ## Known limitations
 
-- **Logs and traces in Test and Production need the API client's Monitoring permission in those stages.** On `euroconsumers.outsystems.dev` the Portal didn't let that permission be selected for Test and Production (ticket open with OutSystems); until then those stages answer `[permission_denied]`.
+- **Logs and traces only from Development.** OutSystems confirmed (support ticket, October 2026) that an API client can't be given the Monitoring permission in Test or Production: it is inherited from Development through Asset management, and can only become selectable if OutSystems publishes Monitoring REST APIs. Test and Production answer `[permission_denied]`. To get Production logs and traces out of ODC today, OutSystems points to the paid **App Analytics Stream** add-on, which streams them over OpenTelemetry to a monitoring platform (e.g. Dynatrace, New Relic); an app would then read them from that platform's API, not through this library.
+- **Mentor can't read logs or traces**, in any stage: it only sees the app's design (entities, screens, logic, settings). To triage an error, put the error message and stack trace in the `StartAnalysis` question: from `GetAppLogs` in Development, or copied from ODC Portal > Monitoring for Test and Production.
 - **It acts as the API client**, with its permissions and Mentor usage.
 - **Long work takes several calls.** The library keeps each call inside 95 s and 5.5 MB (see "How it stays within ODC's limits"), so long analyses and long lists come in several polls or pages. The full app model (about 10 MB for ImpactMap) can't go through the library, so there is no "get model" action; use `SearchModel` and `ListElements`.
 - **Long values are cut** to their attribute's length, e.g. a log message to 20,000 characters; the MCP server already shortens model values over about 2 KB.

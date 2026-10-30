@@ -85,7 +85,7 @@ internal sealed class McpClient : IDisposable
             if (code.Success) throw new McpTriageException(code.Groups[1].Value, $"{name}: {Shorten(message)}");
             // The API client lacks the permission in ODC Portal, e.g. logs in a stage it can't read
             if (message.Contains("403 Forbidden", StringComparison.Ordinal))
-                throw new McpTriageException("permission_denied", $"{name}: the API client has no permission for this. Grant it in ODC Portal > API clients > Edit permissions, for the stage asked. {Shorten(message)}");
+                throw new McpTriageException("permission_denied", $"{name}: the API client has no permission for this. ODC doesn't let API clients read logs and traces outside Development; for anything else, check its permissions in ODC Portal > API clients. {Shorten(message)}");
             throw new McpTriageException("tool_error", $"{name}: {Shorten(message)}");
         }
         if (texts.Count == 0) return null;

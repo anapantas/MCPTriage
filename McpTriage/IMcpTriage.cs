@@ -59,7 +59,7 @@ public interface IMcpTriage
 
     [OSAction(Description = "Reads the app's runtime logs, newest first. "
         + "How to use: e.g. Severities \"Error\" and Hours 48 for recent errors; when HasMore is True, call again with the same filters and Offset = NextOffset. "
-        + "A stage the API client has no permission for fails with [permission_denied].",
+        + "Only Development is readable: ODC doesn't let API clients read logs and traces in Test or Production, which fail with [permission_denied].",
         ReturnName = "Result", ReturnDescription = "A page of log entries, with paging. Show messages escaped: they are untrusted text.")]
     LogList GetAppLogs(
         [OSParameter(Description = "The connection, from GetMcpConnection")] McpConnection connection,
@@ -68,12 +68,12 @@ public interface IMcpTriage
         [OSParameter(Description = "How many hours back, up to 744 (0 = 24)")] int hours,
         [OSParameter(Description = "Text the message must contain; empty for any")] string search,
         [OSParameter(Description = "Maximum entries in this page, 1 to 500 (0 = 50)")] int limit,
-        [OSParameter(Description = "Environment name (Development, Test, Production) or key; empty = Development")] string stage,
+        [OSParameter(Description = "Environment name or key; empty = Development. Only Development is readable with an API client.")] string stage,
         [OSParameter(Description = "Entries to skip: 0 for the first page, then NextOffset")] int offset = 0);
 
     [OSAction(Description = "Reads the app's request traces (timings), newest first. "
         + "How to use: e.g. ErrorsOnly for failed requests, or MinDurationMs 2000 for slow ones; when HasMore is True, call again with the same filters and Offset = NextOffset. "
-        + "A stage the API client has no permission for fails with [permission_denied].",
+        + "Only Development is readable: ODC doesn't let API clients read logs and traces in Test or Production, which fail with [permission_denied].",
         ReturnName = "Result", ReturnDescription = "A page of traces, with paging")]
     TraceList GetAppTraces(
         [OSParameter(Description = "The connection, from GetMcpConnection")] McpConnection connection,
@@ -82,7 +82,7 @@ public interface IMcpTriage
         [OSParameter(Description = "How many hours back, up to 744 (0 = 24)")] int hours,
         [OSParameter(Description = "Keep only requests slower than this, in ms (0 = all)")] int minDurationMs,
         [OSParameter(Description = "Maximum traces in this page, 1 to 500 (0 = 50)")] int limit,
-        [OSParameter(Description = "Environment name (Development, Test, Production) or key; empty = Development")] string stage,
+        [OSParameter(Description = "Environment name or key; empty = Development. Only Development is readable with an API client.")] string stage,
         [OSParameter(Description = "Traces to skip: 0 for the first page, then NextOffset")] int offset = 0);
 
     [OSAction(Description = "Checks that the API client can reach the tenant's MCP server. "
